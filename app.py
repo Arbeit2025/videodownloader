@@ -67,7 +67,7 @@ video{max-width:100%;}
 {% endfor %}
 {% else %}
 <p>このページからは直接ダウンロードできる動画ファイルが見つかりませんでした。</p>
-<p class="note">JavaScriptで生成されるプレーヤー、ログイン必須のページ、DRM付き動画、直接ファイルを持たない動画サイトの形式には対応していません。</p>
+<p class="note">JavaScriptで生成されるプレーヤー、ログイン必須のページ、DRM付き動画、直接ファイルを持たない動画サイトの形式には対応していません。YouTubeはサーバーからの自動取得を制限しているため取得できません。</p>
 {% endif %}
 </div>
 {% endif %}
@@ -92,14 +92,17 @@ video{max-width:100%;}
 # =========================
 # [S2] LOGIC
 # =========================
+import gzip
 import ipaddress
 import json
 import os
 import re
 import sqlite3
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from datetime import datetime
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
@@ -119,10 +122,12 @@ UI_TEXT = {
 
 VIDEO_EXTS = {".mp4", ".webm", ".mov", ".m4v", ".mkv", ".avi", ".ogv", ".m3u8", ".mpd"}
 PLAYLIST_EXTS = {".m3u8", ".mpd"}
-MAX_PAGE_BYTES = 2 * 1024 * 1024
+MAX_PAGE_BYTES = 5 * 1024 * 1024
 MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
-FETCH_TIMEOUT = 12
-USER_AGENT = "Mozilla/5.0 (compatible; videodownloader/1.0)"
+FETCH_TIMEOUT = 20
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/126.0.0.0 Safari/537.36")
 
 
 @app.context_processor
@@ -299,29 +304,81 @@ def _opener():
     return urllib.request.build_opener(_ValidatingRedirectHandler())
 
 
-def fetch_url(url):
+def _request_headers(extra=None):
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ja,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def _decode_body(body, content_encoding):
+    enc = (content_encoding or "").lower()
+    try:
+        if enc == "gzip":
+            return gzip.decompress(body)
+        if enc == "deflate":
+            return zlib.decompress(body)
+    except Exception:
+        return body
+    return body
+
+
+def _friendly_fetch_error(e):
+    code = getattr(e, "code", None)
+    if code == 403:
+        return ("ページを取得できませんでした。サイト側がサーバーからの自動取得を"
+                "拒否しました（403 Forbidden）。")
+    if code == 404:
+        return "ページが見つかりませんでした（404）。URLを確認してください。"
+    if code == 429:
+        return ("ページを取得できませんでした。サイト側のアクセス制限にかかりました"
+                "（429 Too Many Requests）。サーバー（Render等）の共有IPからの取得を"
+                "制限しているサイトでは、このツールでは取得できません。")
+    if code:
+        return f"ページを取得できませんでした（HTTP {code}）。"
+    if "timed out" in str(e).lower() or "timeout" in str(e).lower():
+        return "ページの取得がタイムアウトしました。サイトの応答がありませんでした。"
+    return f"ページを取得できませんでした（{e}）"
+
+
+def fetch_url(url, attempts=2):
     """Fetch a page. Returns dict(final_url, content_type, body).
     Raises ValueError for blocked/invalid, RuntimeError for fetch failures."""
     validate_url(url)
     _check_resolved_host(urllib.parse.urlparse(url).hostname or "")
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with _opener().open(req, timeout=FETCH_TIMEOUT) as resp:
-            content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-            body = resp.read(MAX_PAGE_BYTES + 1)
-            if len(body) > MAX_PAGE_BYTES:
-                body = body[:MAX_PAGE_BYTES]
-            return {"final_url": resp.geturl(), "content_type": content_type, "body": body}
-    except ValueError:
-        raise
-    except Exception as e:
-        raise RuntimeError(f"ページを取得できませんでした（{e}）") from e
+    last_err = None
+    for i in range(attempts):
+        req = urllib.request.Request(url, headers=_request_headers())
+        try:
+            with _opener().open(req, timeout=FETCH_TIMEOUT) as resp:
+                content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                raw = resp.read(MAX_PAGE_BYTES * 2 + 1)
+                body = _decode_body(raw, resp.headers.get("Content-Encoding"))[:MAX_PAGE_BYTES]
+                return {"final_url": resp.geturl(), "content_type": content_type, "body": body}
+        except ValueError:
+            raise
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code not in (429, 503) or i == attempts - 1:
+                break
+            time.sleep(1.5)
+        except Exception as e:
+            last_err = e
+            break
+    raise RuntimeError(_friendly_fetch_error(last_err)) from last_err
 
 
 def open_remote_stream(url):
     """Open a remote video for streaming download. Returns (resp, content_type, content_length)."""
     validate_url(url)
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    parsed = urllib.parse.urlparse(url)
+    referer = f"{parsed.scheme}://{parsed.netloc}/"
+    req = urllib.request.Request(url, headers=_request_headers({"Referer": referer}))
     resp = _opener().open(req, timeout=FETCH_TIMEOUT)
     content_type = (resp.headers.get("Content-Type") or "application/octet-stream").split(";")[0].strip()
     length = resp.headers.get("Content-Length")
@@ -418,9 +475,14 @@ def analyze():
                                       candidates=[], page_title="", source_url=url,
                                       error=str(e)), 400
     except RuntimeError as e:
+        error = str(e)
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+        if host == "youtu.be" or host.endswith("youtube.com"):
+            error += (" ※YouTubeはサーバーからの自動取得を強く制限しているため、"
+                      "YouTube動画には対応できません。")
         return render_template_string(HTML, history=db_history(), searched=False,
                                       candidates=[], page_title="", source_url=url,
-                                      error=str(e)), 502
+                                      error=error), 502
 
     final_url = fetched["final_url"]
     ctype = fetched["content_type"]

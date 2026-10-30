@@ -1,8 +1,10 @@
+import gzip
 import importlib.util
 import io
 import os
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 APP_PATH = os.path.join(
@@ -142,6 +144,58 @@ class VideodownloaderTest(unittest.TestCase):
         self.assertEqual(res.status_code, 400)
         res = self.client.get("/download?url=http://192.168.0.1/movie.mp4")
         self.assertEqual(res.status_code, 400)
+
+    def test_friendly_fetch_error_messages(self):
+        for code, needle in [(403, "403"), (404, "404"), (429, "429")]:
+            err = urllib.error.HTTPError("https://example.com/", code, "x", hdrs=None, fp=None)
+            self.assertIn(needle, self.mod._friendly_fetch_error(err))
+            self.assertIn("取得できません", self.mod._friendly_fetch_error(
+                urllib.error.HTTPError("https://example.com/", 403, "x", hdrs=None, fp=None)))
+
+    def test_decode_body_gzip(self):
+        raw = "<html>hello</html>".encode("utf-8")
+        self.assertEqual(self.mod._decode_body(gzip.compress(raw), "gzip"), raw)
+        self.assertEqual(self.mod._decode_body(raw, ""), raw)
+        self.assertEqual(self.mod._decode_body(b"not-gzip", "gzip"), b"not-gzip")
+
+    def test_fetch_retries_on_503_then_succeeds(self):
+        payload = b"<html><head><title>t</title></head></html>"
+
+        class FakeResp(io.BytesIO):
+            headers = {"Content-Type": "text/html; charset=utf-8", "Content-Encoding": ""}
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def geturl(self):
+                return "https://example.com/page"
+
+        class FakeOpener:
+            def __init__(self):
+                self.calls = 0
+            def open(self, req, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise urllib.error.HTTPError(req.full_url, 503, "busy", hdrs=None, fp=None)
+                return FakeResp(payload)
+
+        opener = FakeOpener()
+        with mock.patch.object(self.mod, "_opener", return_value=opener), \
+             mock.patch("time.sleep", return_value=None):
+            got = self.mod.fetch_url("https://example.com/page")
+        self.assertEqual(opener.calls, 2)
+        self.assertEqual(got["body"], payload)
+        self.assertEqual(got["content_type"], "text/html")
+
+    def test_fetch_403_raises_friendly(self):
+        class FakeOpener:
+            def open(self, req, timeout=None):
+                raise urllib.error.HTTPError(req.full_url, 403, "forbidden", hdrs=None, fp=None)
+
+        with mock.patch.object(self.mod, "_opener", return_value=FakeOpener()):
+            with self.assertRaises(RuntimeError) as cm:
+                self.mod.fetch_url("https://example.com/page")
+        self.assertIn("403", str(cm.exception))
 
     def test_download_too_large_413(self):
         fake_resp = mock.Mock()
